@@ -1,0 +1,114 @@
+name: Kubernetes Validation
+
+on:
+  workflow_call:
+    inputs:
+      roots:
+        description: >-
+          Space-separated manifest roots to watch. Each changed unit directory
+          under a root is kustomize-built and kubeconform-validated.
+          Example: "kubernetes/apps kubernetes/components"
+        required: true
+        type: string
+
+env:
+  KUSTOMIZE_VERSION: "5.4.3"
+  KUBECONFORM_VERSION: "0.6.7"
+  KUBERNETES_VERSION: "1.32.0"
+
+jobs:
+  detect-changes:
+    name: Detect changed manifest directories
+    runs-on: ubuntu-latest
+    outputs:
+      paths: ${{ steps.changed.outputs.paths }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Get changed manifest directories
+        id: changed
+        env:
+          ROOTS: ${{ inputs.roots }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            CHANGED=$(git diff --name-only \
+              "${{ github.event.pull_request.base.sha }}" \
+              "${{ github.event.pull_request.head.sha }}")
+          else
+            CHANGED=$(git diff --name-only HEAD~1 HEAD)
+          fi
+
+          ROOT_RE="$(printf '%s' "${ROOTS}" | tr ' ' '|')"
+
+          PATHS=$(echo "${CHANGED}" \
+            | grep -E "^(${ROOT_RE})/" \
+            | sed -nE "s#^(${ROOT_RE})/([^/]*)/.*#\1/\2#p" \
+            | sort -u \
+            | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+          echo "paths=${PATHS}" >> "${GITHUB_OUTPUT}"
+          echo "Changed paths: ${PATHS}"
+
+  validate:
+    name: "${{ matrix.path }}"
+    needs: detect-changes
+    if: needs.detect-changes.outputs.paths != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        path: ${{ fromJson(needs.detect-changes.outputs.paths) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup kustomize
+        env:
+          KUSTOMIZE_VERSION: ${{ env.KUSTOMIZE_VERSION }}
+        run: |
+          curl -fsSL \
+            "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
+            -o kustomize.tar.gz
+          tar -xzf kustomize.tar.gz
+          sudo mv kustomize /usr/local/bin/kustomize
+
+      - name: Setup kubeconform
+        env:
+          KUBECONFORM_VERSION: ${{ env.KUBECONFORM_VERSION }}
+        run: |
+          curl -fsSL \
+            "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            -o kubeconform.tar.gz
+          tar -xzf kubeconform.tar.gz
+          sudo mv kubeconform /usr/local/bin/kubeconform
+
+      - name: Kustomize build
+        run: |
+          kustomize build "${{ matrix.path }}" > /tmp/built.yaml
+
+      - name: Substitute Flux postBuild placeholders
+        run: |
+          # kubeconform validates raw manifests, but Flux substitutes these
+          # placeholders at apply time (from the domain-config secret), so
+          # validate with placeholder values of the same shape
+          sed -i \
+            -e 's/\${LOCAL_DOMAIN}/example.lab/g' \
+            -e 's/\${BASE_DOMAIN}/example.lab/g' \
+            -e 's/\${ACME_EMAIL}/admin@example.lab/g' \
+            -e 's|\${SLACK_WEBHOOK_URL}|https://hooks.example.lab/webhook|g' \
+            /tmp/built.yaml
+
+      - name: Kubeconform
+        env:
+          KUBERNETES_VERSION: ${{ env.KUBERNETES_VERSION }}
+        run: |
+          kubeconform \
+            -kubernetes-version "${KUBERNETES_VERSION}" \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            -ignore-missing-schemas \
+            -summary \
+            /tmp/built.yaml
