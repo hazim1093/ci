@@ -4,6 +4,8 @@ Shared, reusable GitHub Actions workflows for hazim1093's repositories. Public b
 
 Version pins (kustomize, kubeconform, kubernetes) live here, so tool bumps happen in one place.
 
+Each workflow is standalone: independent triggers, no `needs:` coupling, usable alone in any repo — k8s repos, app repos, docs repos. When a repo calls both, they run as two parallel checks.
+
 ## Reusable workflows
 
 ### k8s-validation
