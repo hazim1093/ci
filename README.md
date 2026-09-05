@@ -63,4 +63,10 @@ on:
 
 ## Versioning
 
-Callers reference `@main` for rolling updates. Once stable, cut a tag (e.g. `v1`) and bump callers to `@v1` to pin.
+Releases are automated from Conventional Commits (release-please):
+
+- `fix` → patch, `feat` → minor, `feat!`/`BREAKING CHANGE:` → major
+- On merge to `main`, release-please opens a `chore(main): release vX.Y.Z` PR with the changelog; merging it cuts the tag + GitHub Release and moves the floating major tag (`v1`)
+- PR titles are validated against Conventional Commits, since squash-merge titles become the release commits
+
+Callers pin the floating major — `@v1` — so fixes and features flow automatically while breaking changes land as `@v2` and are adopted deliberately.
