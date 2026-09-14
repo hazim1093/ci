@@ -1,0 +1,23 @@
+name: PR Title Check
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  conventional-title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR title follows Conventional Commits
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          # Squash-merge titles become release commits, so the title IS the
+          # versioning input for release-please
+          if ! echo "${TITLE}" | grep -qE '^(feat|fix|docs|ci|chore|refactor|perf|test|revert)(\(.+\))?!?: .+'; then
+            echo "::error::PR title must follow Conventional Commits: 'type(scope): description' (types: feat, fix, docs, ci, chore, refactor, perf, test, revert). Got: '${TITLE}'"
+            exit 1
+          fi
