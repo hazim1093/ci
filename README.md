@@ -6,6 +6,23 @@ Version pins (kustomize, kubeconform, kubernetes) live here, so tool bumps happe
 
 Each workflow is standalone: independent triggers, no `needs:` coupling, usable alone in any repo — k8s repos, app repos, docs repos. When a repo calls both, they run as two parallel checks.
 
+## Caller permissions
+
+A called workflow's jobs can only request permissions the **caller** explicitly grants. With no `permissions:` block in the caller, every scope is `none`, and GitHub rejects the run before it starts:
+
+```
+Invalid workflow file: .github/workflows/secret-scan.yml#L10
+The nested job 'secret-scan' is requesting 'pull-requests: write',
+but is only allowed 'pull-requests: none'.
+```
+
+So every caller must declare the scopes its called workflow needs:
+
+| Workflow | Caller `permissions:` |
+| --- | --- |
+| `k8s-validation` | `contents: read` |
+| `secret-scan` | `contents: read`, `pull-requests: write` |
+
 ## Reusable workflows
 
 ### k8s-validation
@@ -15,6 +32,9 @@ Kustomize-builds and kubeconform-validates every changed manifest unit directory
 Callers pass the manifest roots they manage, space-separated:
 
 ```yaml
+permissions:
+  contents: read
+
 jobs:
   validate:
     uses: hazim1093/ci/.github/workflows/k8s-validation.yml@main
@@ -47,6 +67,10 @@ on:
 Gitleaks scan of every push/PR; comments the offending files on the PR, fails the check when leaks are found, warns on main.
 
 ```yaml
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   secret-scan:
     uses: hazim1093/ci/.github/workflows/secret-scan.yml@main
@@ -61,12 +85,8 @@ on:
     branches: [main]
 ```
 
-## Versioning
+## Pinning
 
-Releases are automated from Conventional Commits (release-please):
+Callers reference `@main`. There is no release or tag step: the workflows are consumed as-is, so a merge here lands in every caller on its next run.
 
-- `fix` → patch, `feat` → minor, `feat!`/`BREAKING CHANGE:` → major
-- On merge to `main`, release-please opens a `chore(main): release vX.Y.Z` PR with the changelog; merging it cuts the tag + GitHub Release and moves the floating major tag (`v1`)
-- PR titles are validated against Conventional Commits, since squash-merge titles become the release commits
-
-Callers pin the floating major — `@v1` — so fixes and features flow automatically while breaking changes land as `@v2` and are adopted deliberately.
+To raise the tool versions, bump `KUSTOMIZE_VERSION` / `KUBECONFORM_VERSION` / `KUBERNETES_VERSION` in the workflow `env:` block — every caller picks it up with no change on their side.
