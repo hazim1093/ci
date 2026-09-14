@@ -1,0 +1,322 @@
+name: K8s Preview
+
+# Ephemeral per-PR preview environments on the home-lab cluster.
+#
+# Convention (all derived from `app`):
+#   namespace          pr-<app>-<PR>
+#   ReferenceGrant     pr-<app>-<PR>-to-keda-http   (in the keda-http namespace)
+#   overlay directory  <manifests_path>/previews/<app>/
+#   images             ghcr.io/<caller owner>/<image>:pr-<PR>
+#
+# The overlay is built with kustomize and envsubst'ed before apply, so the
+# caller's overlay can use ${PR_NUMBER}, ${LOCAL_DOMAIN} and one ${<var>} per
+# entry in `images` (digest pinning; re-running /preview on the same PR is
+# idempotent and still picks up the new push).
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: >-
+          App name; drives the namespace, ReferenceGrant, source namespace and
+          default overlay path conventions above.
+        required: true
+        type: string
+      images:
+        description: >-
+          JSON array, one object per image to build:
+          {"name": "<ghcr image name>", "dockerfile": "<path>",
+          "var": "<envsubst variable name the overlay expects>",
+          "build_args": ["KEY=VALUE", ...]  // optional
+          }
+        required: true
+        type: string
+      deployments:
+        description: JSON array of Deployment names to wait for a rollout.
+        required: true
+        type: string
+      preview_url:
+        description: >-
+          Preview URL template with ${PR_NUMBER} / ${LOCAL_DOMAIN}
+          placeholders, e.g. "http://pr-myapp-${PR_NUMBER}.${LOCAL_DOMAIN}".
+        required: true
+        type: string
+      manifests_repo:
+        description: >-
+          Repo name (same owner as the caller) holding the app manifests and
+          preview overlays, e.g. "home-lab-private". Must be reachable by the
+          GitHub App in GH_APP_ID / GH_APP_PRIVATE_KEY.
+        required: true
+        type: string
+      manifests_path:
+        description: Path inside manifests_repo holding apps/ and previews/.
+        required: false
+        type: string
+        default: kubernetes
+      overlay_path:
+        description: >-
+          Overlay directory to build, relative to manifests_path. Defaults to
+          previews/<app>.
+        required: false
+        type: string
+        default: ""
+      copy_secrets:
+        description: >-
+          JSON array of Secret names to copy from the app's namespace into the
+          preview namespace (secrets are never built by the overlay itself).
+        required: false
+        type: string
+        default: '["ghcr-pull-secret"]'
+      referencegrant:
+        description: >-
+          File name of the per-PR ReferenceGrant inside the overlay directory,
+          or empty to skip. It must stay in the keda-http namespace (the
+          overlay's namespace transformer would relocate it, so it is applied
+          separately) and be named pr-<app>-<PR>-to-keda-http.
+        required: false
+        type: string
+        default: referencegrant.yaml
+    secrets:
+      LOCAL_DOMAIN:
+        required: true
+      GH_APP_ID:
+        required: true
+      GH_APP_PRIVATE_KEY:
+        required: true
+
+jobs:
+  check:
+    name: Check trigger
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      pull-requests: read
+    outputs:
+      should_deploy: ${{ steps.gate.outputs.result }}
+      check_run_id: ${{ steps.create-check.outputs.check_run_id }}
+    steps:
+      - name: Gate
+        id: gate
+        env:
+          IS_PR: ${{ github.event.issue.pull_request != '' }}
+          HAS_TRIGGER: ${{ contains(github.event.comment.body, '/preview') }}
+          IS_MEMBER: ${{ contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) }}
+        run: |
+          if [ "${IS_PR}" = "true" ] && [ "${HAS_TRIGGER}" = "true" ] && [ "${IS_MEMBER}" = "true" ]; then
+            echo "result=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "result=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      # issue_comment events aren't tied to a commit, so this run never shows up
+      # under the PR's Checks tab on its own. Create a check run against the PR's
+      # head SHA so the preview status is visible there; finalize job closes it out.
+      - name: Create check run
+        id: create-check
+        if: steps.gate.outputs.result == 'true'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.issue.number,
+            });
+            const checkRun = await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: "Preview",
+              head_sha: pr.data.head.sha,
+              status: "in_progress",
+              details_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+            core.setOutput("check_run_id", checkRun.data.id);
+
+  build:
+    name: Build preview images
+    needs: check
+    if: needs.check.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      # JSON [{var, digest}] consumed by the deploy job's envsubst
+      digests: ${{ steps.build.outputs.digests }}
+    env:
+      PR_NUMBER: ${{ github.event.issue.number }}
+      LOCAL_DOMAIN: ${{ secrets.LOCAL_DOMAIN }}
+      IMAGES: ${{ inputs.images }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/pull/${{ github.event.issue.number }}/head
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        run: |
+          set -euo pipefail
+          DIGESTS='[]'
+          while IFS= read -r cfg; do
+            NAME=$(jq -r '.name' <<<"${cfg}")
+            DOCKERFILE=$(jq -r '.dockerfile' <<<"${cfg}")
+            VAR=$(jq -r '.var' <<<"${cfg}")
+            IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/${NAME}:pr-${PR_NUMBER}"
+
+            BUILD_ARGS=()
+            while IFS= read -r line; do
+              [ -z "${line}" ] && continue
+              # ${PR_NUMBER} / ${LOCAL_DOMAIN} are valid here (e.g. a frontend
+              # bundle that needs the preview hostname baked in at build time)
+              BUILD_ARGS+=(--build-arg "$(envsubst '${PR_NUMBER} ${LOCAL_DOMAIN}' <<<"${line}")")
+            done < <(jq -r '(.build_args // [])[]' <<<"${cfg}")
+
+            echo "Building ${IMAGE} from ${DOCKERFILE}"
+            docker buildx build \
+              --push \
+              --file "${DOCKERFILE}" \
+              --tag "${IMAGE}" \
+              --cache-from "type=gha,scope=${NAME}" \
+              --cache-to "type=gha,mode=max,scope=${NAME},ignore-error=true" \
+              --metadata-file /tmp/build-metadata.json \
+              "${BUILD_ARGS[@]}" \
+              .
+
+            DIGEST=$(jq -r '."containerimage.digest"' /tmp/build-metadata.json)
+            DIGESTS=$(jq -c --arg v "${VAR}" --arg d "${DIGEST}" '. + [{var: $v, digest: $d}]' <<<"${DIGESTS}")
+          done < <(jq -c '.[]' <<<"${IMAGES}")
+
+          echo "digests=${DIGESTS}" >> "${GITHUB_OUTPUT}"
+          echo "Built digests: ${DIGESTS}"
+
+  deploy:
+    name: Deploy preview
+    needs: [build]
+    runs-on: arc-cluster-runner
+    # Post comment uses GITHUB_TOKEN — without write it inherits the repo's
+    # read-only default and can't comment on the PR.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    env:
+      PR_NUMBER: ${{ github.event.issue.number }}
+      LOCAL_DOMAIN: ${{ secrets.LOCAL_DOMAIN }}
+      APP: ${{ inputs.app }}
+      MANIFESTS_REPO: ${{ inputs.manifests_repo }}
+      MANIFESTS_PATH: ${{ inputs.manifests_path }}
+      OVERLAY_INPUT: ${{ inputs.overlay_path }}
+      COPY_SECRETS: ${{ inputs.copy_secrets }}
+      REFERENCEGRANT: ${{ inputs.referencegrant }}
+      DEPLOYMENTS: ${{ inputs.deployments }}
+      PREVIEW_URL: ${{ inputs.preview_url }}
+      DIGESTS: ${{ needs.build.outputs.digests }}
+    steps:
+      - name: Mint app token for the manifests repo
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          repositories: ${{ inputs.manifests_repo }}
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository_owner }}/${{ inputs.manifests_repo }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: manifests
+
+      - name: Create namespace
+        run: |
+          kubectl create namespace "pr-${APP}-${PR_NUMBER}" --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Copy secrets into the preview namespace
+        run: |
+          while IFS= read -r secret; do
+            [ -z "${secret}" ] && continue
+            kubectl get secret "${secret}" -n "${APP}" -o json \
+              | jq 'del(.metadata.namespace,.metadata.resourceVersion,.metadata.uid,.metadata.creationTimestamp)' \
+              | jq --arg ns "pr-${APP}-${PR_NUMBER}" '.metadata.namespace = $ns' \
+              | kubectl apply -f -
+          done < <(jq -r '.[]' <<<"${COPY_SECRETS}")
+
+      - name: Apply preview manifests
+        run: |
+          set -euo pipefail
+          OVERLAY="${OVERLAY_INPUT:-previews/${APP}}"
+          TMP="$(mktemp -d)"
+          cp -r "manifests/${MANIFESTS_PATH}/." "${TMP}/"
+
+          # ${PR_NUMBER}, ${LOCAL_DOMAIN} plus one ${<var>} per built image
+          VARS='${PR_NUMBER} ${LOCAL_DOMAIN}'
+          while IFS= read -r row; do
+            VAR=$(jq -r '.var' <<<"${row}")
+            export "${VAR}=$(jq -r '.digest' <<<"${row}")"
+            VARS="${VARS} \${${VAR}}"
+          done < <(jq -c '.[]' <<<"${DIGESTS}")
+
+          kubectl kustomize --load-restrictor LoadRestrictionsNone "${TMP}/${OVERLAY}" \
+            | envsubst "${VARS}" \
+            | kubectl apply -f -
+
+      - name: Apply ReferenceGrant for KEDA interceptor routing
+        if: inputs.referencegrant != ''
+        run: |
+          OVERLAY="${OVERLAY_INPUT:-previews/${APP}}"
+          envsubst '${PR_NUMBER} ${LOCAL_DOMAIN}' \
+            < "manifests/${MANIFESTS_PATH}/${OVERLAY}/${REFERENCEGRANT}" \
+            | kubectl apply -f -
+
+      - name: Wait for rollout
+        run: |
+          while IFS= read -r deployment; do
+            [ -z "${deployment}" ] && continue
+            kubectl rollout status "deployment/${deployment}" -n "pr-${APP}-${PR_NUMBER}" --timeout=120s
+          done < <(jq -r '.[]' <<<"${DEPLOYMENTS}")
+
+      - name: Post comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          URL: ${{ inputs.preview_url }}
+        run: |
+          gh pr comment "${PR_NUMBER}" \
+            --repo ${{ github.repository }} \
+            --body "Preview deployed: $(envsubst '${PR_NUMBER} ${LOCAL_DOMAIN}' <<<"${URL}")"
+
+  finalize:
+    name: Finalize preview check
+    needs: [check, deploy]
+    if: always() && needs.check.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+    steps:
+      - name: Update check run
+        uses: actions/github-script@v9
+        env:
+          PREVIEW_URL: ${{ inputs.preview_url }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          LOCAL_DOMAIN: ${{ secrets.LOCAL_DOMAIN }}
+        with:
+          script: |
+            const success = "${{ needs.deploy.result }}" === "success";
+            const url = process.env.PREVIEW_URL
+              .replace(/\$\{PR_NUMBER\}/g, process.env.PR_NUMBER)
+              .replace(/\$\{LOCAL_DOMAIN\}/g, process.env.LOCAL_DOMAIN);
+            await github.rest.checks.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              check_run_id: ${{ needs.check.outputs.check_run_id }},
+              status: "completed",
+              conclusion: success ? "success" : "failure",
+              details_url: success
+                ? url
+                : `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });

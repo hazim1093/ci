@@ -22,6 +22,9 @@ So every caller must declare the scopes its called workflow needs:
 | --- | --- |
 | `k8s-validation` | `contents: read` |
 | `secret-scan` | `contents: read`, `pull-requests: write` |
+| `docker-build-push` | `contents: read`, `packages: write` |
+| `k8s-preview` | `contents: read`, `packages: write`, `pull-requests: write`, `issues: write`, `checks: write` |
+| `k8s-preview-teardown` | `contents: read`, `pull-requests: write`, `issues: write` |
 
 ## Reusable workflows
 
@@ -84,6 +87,78 @@ on:
   push:
     branches: [main]
 ```
+
+### docker-build-push
+
+Builds one image and pushes it to `ghcr.io/<caller owner>/<image>` (`contents: read`,
+`packages: write` in the caller). One call per image, so a two-image app runs two of these
+in parallel; each gets its own `gha` cache scope keyed by image name.
+
+| Input | Meaning |
+| --- | --- |
+| `image` | Image name without registry/tag, e.g. `screener-api` |
+| `dockerfile` | Dockerfile path, relative to `context` |
+| `context` | Build context (default `.`) |
+| `version` | Image tag; empty = the caller's latest release tag, else `latest` |
+| `tag_as_latest` | Also push `:latest` |
+| `build_args` | Newline-separated `KEY=VALUE` build arguments |
+
+Caller (keeps `workflow_dispatch` so it can also be run by hand):
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      version: { description: "Image tag", required: false, default: "" }
+      tag_as_latest: { type: boolean, default: false }
+  workflow_call:
+    inputs:
+      version: { type: string, required: false, default: "" }
+      tag_as_latest: { type: boolean, default: false }
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    uses: hazim1093/ci/.github/workflows/docker-build-push.yml@main
+    with:
+      image: my-app
+      dockerfile: Dockerfile
+      version: ${{ inputs.version }}
+      tag_as_latest: ${{ inputs.tag_as_latest }}
+```
+
+### k8s-preview / k8s-preview-teardown
+
+Ephemeral per-PR environments on the home-lab cluster: build `pr-<n>` images, copy the app's
+secrets into a fresh namespace, apply a kustomize overlay from a private manifests repo, wait
+for rollout, then comment on the PR. Teardown deletes namespace + ReferenceGrant on PR close
+or `/teardown-preview`. Callers keep their own `on:` triggers and pass `secrets: inherit`
+(the workflows declare `LOCAL_DOMAIN`, `GH_APP_ID`, `GH_APP_PRIVATE_KEY`).
+
+Conventions derived from `app`:
+
+| Thing | Value |
+| --- | --- |
+| Preview namespace | `pr-<app>-<PR>` |
+| ReferenceGrant (keda-http ns) | `pr-<app>-<PR>-to-keda-http` |
+| Overlay directory | `<manifests_path>/previews/<app>/` |
+| Image tags | `ghcr.io/<caller owner>/<image>:pr-<PR>`, digest-pinned into the overlay |
+
+`k8s-preview` inputs: `app`, `images` (JSON array of
+`{name, dockerfile, var, build_args}`, where `var` is the `${...}` name the overlay expects
+for that image's digest), `deployments` (JSON array), `preview_url` (template with
+`${PR_NUMBER}`/`${LOCAL_DOMAIN}`), `manifests_repo`, plus optional `manifests_path`,
+`overlay_path`, `copy_secrets`, `referencegrant`.
+
+The overlay is rendered with `kubectl kustomize --load-restrictor LoadRestrictionsNone` and
+envsubst'ed with `${PR_NUMBER}`, `${LOCAL_DOMAIN}` and one `<var>` per image. Secrets are never
+rendered by the overlay — `copy_secrets` copies them from the app's namespace. The
+ReferenceGrant is applied separately (it must stay in `keda-http`, but the overlay's global
+`namespace:` transformer would relocate it) and deleted by name on teardown, so it is not one
+of the overlay kustomization's `resources`.
 
 ## Pinning
 

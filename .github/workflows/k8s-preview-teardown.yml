@@ -1,0 +1,83 @@
+name: K8s Preview Teardown
+
+# Deletes the ephemeral preview environment created by `k8s-preview.yml`.
+#
+# Convention (all derived from `app`):
+#   namespace       pr-<app>-<PR>                    (deleted; PVCs go with it)
+#   ReferenceGrant  pr-<app>-<PR>-to-keda-http       (lives in keda-http, so the
+#                                                    namespace delete misses it)
+#
+# The gate lives here, not in the caller: it only reads the event payload, so
+# callers stay down to their own `on:` triggers + one job.
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: App name; drives the namespace / ReferenceGrant conventions.
+        required: true
+        type: string
+      delete_referencegrant:
+        description: Delete the per-PR ReferenceGrant from the keda-http namespace.
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  check:
+    name: Check trigger
+    runs-on: ubuntu-latest
+    outputs:
+      should_teardown: ${{ steps.gate.outputs.result }}
+      pr_number: ${{ steps.gate.outputs.pr_number }}
+    steps:
+      - name: Gate
+        id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMENT_PR: ${{ github.event.issue.number }}
+          IS_PR_COMMENT: ${{ github.event.issue.pull_request != '' }}
+          HAS_TRIGGER: ${{ contains(github.event.comment.body, '/teardown-preview') }}
+        run: |
+          if [ "${EVENT}" = "pull_request" ]; then
+            echo "result=true" >> "${GITHUB_OUTPUT}"
+            echo "pr_number=${PR_NUMBER}" >> "${GITHUB_OUTPUT}"
+          elif [ "${IS_PR_COMMENT}" = "true" ] && [ "${HAS_TRIGGER}" = "true" ]; then
+            echo "result=true" >> "${GITHUB_OUTPUT}"
+            echo "pr_number=${COMMENT_PR}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "result=false" >> "${GITHUB_OUTPUT}"
+            echo "pr_number=" >> "${GITHUB_OUTPUT}"
+          fi
+
+  teardown:
+    name: Teardown
+    needs: check
+    if: needs.check.outputs.should_teardown == 'true'
+    runs-on: arc-cluster-runner
+    # Post comment uses GITHUB_TOKEN — needs write to comment on the PR.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    env:
+      PR_NUMBER: ${{ needs.check.outputs.pr_number }}
+      APP: ${{ inputs.app }}
+    steps:
+      - name: Delete namespace
+        run: kubectl delete namespace "pr-${APP}-${PR_NUMBER}" --ignore-not-found
+
+      - name: Delete ReferenceGrant
+        if: inputs.delete_referencegrant
+        run: |
+          kubectl delete referencegrant "pr-${APP}-${PR_NUMBER}-to-keda-http" \
+            -n keda-http --ignore-not-found
+
+      - name: Post comment
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment "${PR_NUMBER}" \
+            --repo ${{ github.repository }} \
+            --body "Preview environment pr-${APP}-${PR_NUMBER} torn down."
