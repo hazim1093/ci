@@ -42,10 +42,13 @@ jobs:
 
           ROOT_RE="$(printf '%s' "${ROOTS}" | tr ' ' '|')"
 
+          # A unit deleted in this PR has nothing left to build, so drop it from the
+          # matrix. Deletions inside a surviving unit still validate that unit.
           PATHS=$(echo "${CHANGED}" \
             | grep -E "^(${ROOT_RE})/" \
             | sed -nE "s#^(${ROOT_RE})/([^/]*)/.*#\1/\2#p" \
             | sort -u \
+            | while read -r unit; do [ -d "${unit}" ] && echo "${unit}"; done \
             | jq -R -s -c 'split("\n") | map(select(length > 0))')
 
           echo "paths=${PATHS}" >> "${GITHUB_OUTPUT}"
