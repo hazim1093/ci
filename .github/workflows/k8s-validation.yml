@@ -104,11 +104,78 @@ jobs:
             -e 's|\${SLACK_WEBHOOK_URL}|https://hooks.example.lab/webhook|g' \
             /tmp/built.yaml
 
+      - name: Kubeconform (warm schema cache)
+        env:
+          KUBERNETES_VERSION: ${{ env.KUBERNETES_VERSION }}
+          KUBECONFORM_CACHE: ${{ runner.temp }}/kubeconform-cache
+        run: |
+          # Downloads the CRD schemas into -cache so the patch step below can fix
+          # them; the verdict here is thrown away on purpose (the next Kubeconform
+          # run is the gate). See that step for why patching is needed at all.
+          mkdir -p "${KUBECONFORM_CACHE}"
+          kubeconform \
+            -cache "${KUBECONFORM_CACHE}" \
+            -kubernetes-version "${KUBERNETES_VERSION}" \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            -ignore-missing-schemas \
+            /tmp/built.yaml || true
+
+      - name: Kubeconform (patch impossible duration constraints)
+        env:
+          KUBECONFORM_CACHE: ${{ runner.temp }}/kubeconform-cache
+        run: |
+          # Some published CRD schemas put BOTH `format: duration` and a Go-duration
+          # `pattern` on the same property (grafana-operator's GrafanaAlertRuleGroup
+          # spec.interval is one). kubeconform reads that format as ISO-8601 (PT1M)
+          # while the pattern only accepts Go durations (1m), so the property becomes
+          # unsatisfiable: no value passes, and the resource can never validate. The
+          # pattern is the stronger check and the one the CRD author intended, so
+          # drop the contradictory format -- only where a pattern sits beside it.
+          python3 - "${KUBECONFORM_CACHE}" <<'PY'
+          import json
+          import os
+          import sys
+
+          root = sys.argv[1]
+          patched = 0
+          for dirpath, _dirnames, filenames in os.walk(root):
+              for filename in filenames:
+                  path = os.path.join(dirpath, filename)
+                  try:
+                      with open(path) as handle:
+                          document = json.load(handle)
+                  except (OSError, ValueError):
+                      continue
+
+                  def scrub(node):
+                      global patched
+                      if isinstance(node, dict):
+                          if node.get("format") == "duration" and "pattern" in node:
+                              del node["format"]
+                              patched += 1
+                          for value in node.values():
+                              scrub(value)
+                      elif isinstance(node, list):
+                          for value in node:
+                              scrub(value)
+
+                  before = json.dumps(document, sort_keys=True)
+                  scrub(document)
+                  if json.dumps(document, sort_keys=True) != before:
+                      with open(path, "w") as handle:
+                          json.dump(document, handle)
+
+          print(f"dropped {patched} unsatisfiable duration format(s) from cached schemas")
+          PY
+
       - name: Kubeconform
         env:
           KUBERNETES_VERSION: ${{ env.KUBERNETES_VERSION }}
+          KUBECONFORM_CACHE: ${{ runner.temp }}/kubeconform-cache
         run: |
           kubeconform \
+            -cache "${KUBECONFORM_CACHE}" \
             -kubernetes-version "${KUBERNETES_VERSION}" \
             -schema-location default \
             -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
