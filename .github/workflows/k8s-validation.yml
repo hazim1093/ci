@@ -108,9 +108,15 @@ jobs:
         env:
           KUBERNETES_VERSION: ${{ env.KUBERNETES_VERSION }}
         run: |
+          # schemas/ (in this repo) carries local overrides for upstream CRD
+          # schemas that are wrong as published (see schemas/README.md).
+          # Checked before the CRDs-catalog mirror, so a match here wins over
+          # the remote copy for that one GVK; every other Kind still falls
+          # through to CRDs-catalog as before.
           kubeconform \
             -kubernetes-version "${KUBERNETES_VERSION}" \
             -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/hazim1093/ci/main/schemas/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
             -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
             -ignore-missing-schemas \
             -summary \
