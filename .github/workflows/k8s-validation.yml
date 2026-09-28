@@ -104,19 +104,37 @@ jobs:
             -e 's|\${SLACK_WEBHOOK_URL}|https://hooks.example.lab/webhook|g' \
             /tmp/built.yaml
 
+      - name: Patch known-bad CRD schemas
+        run: |
+          # grafana-operator's GrafanaAlertRuleGroup CRD marks spec.interval and
+          # spec.rules[].keepFiringFor as `format: duration`, which JSON Schema
+          # defines as an RFC 3339/ISO 8601 duration (e.g. "PT1M"). Both fields
+          # are actually Go's metav1.Duration, parsed with time.ParseDuration
+          # (e.g. "1m"), so any value that's actually valid for the field fails
+          # kubeconform's format assertion. Fetch the real upstream schema fresh
+          # on every run (so it tracks CRDs-catalog automatically) and strip
+          # just those two incorrect `format` keys; the `pattern` regex on each,
+          # which does correctly constrain Go-style durations, is left as-is.
+          mkdir -p /tmp/schema-overrides/grafana.integreatly.org
+          curl -fsSL \
+            https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/grafana.integreatly.org/grafanaalertrulegroup_v1beta1.json \
+            | jq 'del(
+                .properties.spec.properties.interval.format,
+                .properties.spec.properties.rules.items.properties.keepFiringFor.format
+              )' \
+            > /tmp/schema-overrides/grafana.integreatly.org/grafanaalertrulegroup_v1beta1.json
+
       - name: Kubeconform
         env:
           KUBERNETES_VERSION: ${{ env.KUBERNETES_VERSION }}
         run: |
-          # schemas/ (in this repo) carries local overrides for upstream CRD
-          # schemas that are wrong as published (see schemas/README.md).
-          # Checked before the CRDs-catalog mirror, so a match here wins over
-          # the remote copy for that one GVK; every other Kind still falls
-          # through to CRDs-catalog as before.
+          # /tmp/schema-overrides (populated above) is checked before the
+          # CRDs-catalog mirror, so a match there wins for that one GVK; every
+          # other Kind still resolves against CRDs-catalog as before.
           kubeconform \
             -kubernetes-version "${KUBERNETES_VERSION}" \
             -schema-location default \
-            -schema-location 'https://raw.githubusercontent.com/hazim1093/ci/main/schemas/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            -schema-location '/tmp/schema-overrides/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
             -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
             -ignore-missing-schemas \
             -summary \
