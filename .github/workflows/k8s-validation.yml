@@ -104,13 +104,28 @@ jobs:
             -e 's|\${SLACK_WEBHOOK_URL}|https://hooks.example.lab/webhook|g' \
             /tmp/built.yaml
 
+      - name: Patch known-bad CRD schemas
+        run: |
+          # GrafanaAlertRuleGroup's CRD wrongly tags Go-duration fields (e.g. "1m")
+          # as JSON Schema `format: duration` (RFC 3339). Strip that assertion only.
+          mkdir -p /tmp/schema-overrides/grafana.integreatly.org
+          curl -fsSL \
+            https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/grafana.integreatly.org/grafanaalertrulegroup_v1beta1.json \
+            | jq 'del(
+                .properties.spec.properties.interval.format,
+                .properties.spec.properties.rules.items.properties.keepFiringFor.format
+              )' \
+            > /tmp/schema-overrides/grafana.integreatly.org/grafanaalertrulegroup_v1beta1.json
+
       - name: Kubeconform
         env:
           KUBERNETES_VERSION: ${{ env.KUBERNETES_VERSION }}
         run: |
+          # /tmp/schema-overrides is checked before the CRDs-catalog mirror.
           kubeconform \
             -kubernetes-version "${KUBERNETES_VERSION}" \
             -schema-location default \
+            -schema-location '/tmp/schema-overrides/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
             -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
             -ignore-missing-schemas \
             -summary \
