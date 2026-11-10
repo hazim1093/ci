@@ -100,6 +100,8 @@ jobs:
           sed -i \
             -e 's/\${LOCAL_DOMAIN}/example.lab/g' \
             -e 's/\${BASE_DOMAIN}/example.lab/g' \
+            -e 's/\${PUBLIC_BASE_DOMAIN}/example.lab/g' \
+            -e 's/\${PUBLIC_HQ_DOMAIN}/example.lab/g' \
             -e 's/\${ACME_EMAIL}/admin@example.lab/g' \
             -e 's|\${SLACK_WEBHOOK_URL}|https://hooks.example.lab/webhook|g' \
             /tmp/built.yaml
